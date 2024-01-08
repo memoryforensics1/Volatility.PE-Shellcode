@@ -9,7 +9,7 @@ from typing import List, Tuple, Iterable
 
 from volatility3.framework import interfaces, exceptions, renderers, constants, symbols
 from volatility3.framework.configuration import requirements
-from volatility3.plugins.windows import pslist, dlllist, vadinfo
+from volatility3.plugins.windows import pslist, dlllist, vadinfo, malfind
 from volatility3.framework.objects import utility
 from volatility3.framework.symbols import intermed
 from volatility3.framework.symbols.windows.extensions import pe
@@ -39,13 +39,6 @@ class DirectSyscalls(interfaces.plugins.PluginInterface):
         self.config['nt_symbols'] = self.context.modules[self.config['kernel']].symbol_table_name
         self.kaddr_space = self.config['primary']
         self._config = self.config
-        self.kvo = self.context.layers[self.kaddr_space].config["kernel_virtual_offset"]
-        self.ntkrnlmp = self._context.module(self.config['nt_symbols'],
-                                             layer_name=self.kaddr_space,
-                                             offset=self.kvo)
-        # self.size_of_pfn = self.ntkrnlmp.get_type("_MMPFN").size
-        # _pointer_struct = struct.Struct("<Q") if self.ntkrnlmp.get_type('pointer').size == 8 else struct.Struct('I')
-        # self.page_file_db = int(_pointer_struct.unpack(self.context.layers[self.kaddr_space].read(self.ntkrnlmp.get_symbol('MmPfnDatabase').address + self.kvo, self.ntkrnlmp.get_type('pointer').size))[0])
 
     @classmethod
     def get_requirements(cls) -> List[interfaces.configuration.RequirementInterface]:
@@ -72,6 +65,9 @@ class DirectSyscalls(interfaces.plugins.PluginInterface):
             requirements.VersionRequirement(
                 name="vadinfo", component=vadinfo.VadInfo, version=(2, 0, 0)
             ),
+            #requirements.VersionRequirement(
+            #    name="malfind", component=malfind.Malfind, version=(2, 0, 0)
+            #),
         ]
 
     def get_dll_exports(
@@ -115,38 +111,6 @@ class DirectSyscalls(interfaces.plugins.PluginInterface):
         return exports
 
     @classmethod
-    def is_vad_empty(cls, proc_layer, vad):
-        """Check if a VAD region is either entirely unavailable due to paging,
-        entirely consisting of zeros, or a combination of the two. This helps
-        ignore false positives whose VAD flags match task._injection_filter
-        requirements but there's no data and thus not worth reporting it.
-
-        Args:
-            proc_layer: the process layer
-            vad: the MMVAD structure to test
-
-        Returns:
-            A boolean indicating whether a vad is empty or not
-        """
-
-        CHUNK_SIZE = 0x1000
-        all_zero_page = b"\x00" * CHUNK_SIZE
-
-        offset = 0
-        vad_length = vad.get_size()
-
-        while offset < vad_length:
-            next_addr = vad.get_start() + offset
-            if (
-                proc_layer.is_valid(next_addr, CHUNK_SIZE)
-                and proc_layer.read(next_addr, CHUNK_SIZE) != all_zero_page
-            ):
-                return False
-            offset += CHUNK_SIZE
-
-        return True
-
-    @classmethod
     def list_injections(
         cls,
         context: interfaces.context.ContextInterface,
@@ -155,7 +119,8 @@ class DirectSyscalls(interfaces.plugins.PluginInterface):
         proc: interfaces.objects.ObjectInterface,
     ) -> Iterable[Tuple[interfaces.objects.ObjectInterface, bytes]]:
         """Generate memory regions for a process that may contain injected
-        code.
+        code. same as malfind function but instead reading 64 bytes lets read all the vad, we can
+        merge this function with additional arg extract_size to master in the future
 
         Args:
             context: The context to retrieve required elements (layers, symbol tables) from
@@ -197,11 +162,47 @@ class DirectSyscalls(interfaces.plugins.PluginInterface):
                 vad.get_private_memory() == 0
                 and protection_string != "PAGE_EXECUTE_WRITECOPY"
             ):
-                if cls.is_vad_empty(proc_layer, vad):
+                if malfind.Malfind.is_vad_empty(proc_layer, vad):
                     continue
 
                 data = proc_layer.read(vad.get_start(), vad.get_size(), pad=True)
                 yield vad, data
+
+    def extract_reg_at_offset(self, prev_instructions, reg_id, offset=0):
+        """ Extract the value of eax at specific offset from disassembly
+        note: could be better identify (in some cases) using unicorn
+        Return:
+            eax/rax value
+        """
+        c_index = -1
+        instruction_to_reg = []
+        for inst in prev_instructions[::-1]:
+            
+            # get eax value from the mov mnemonic
+            if inst.mnemonic == 'mov' and (inst.op_str.startswith('eax') or inst.op_str.startswith('rax')):
+                data_to_display = '\n'
+                eax_new_val = inst.operands[1].imm
+                instruction_to_reg.append(inst)
+                for i in instruction_to_reg[::-1]:
+                    data_to_display += f"{hex(offset+i.address)}\t{i.mnemonic} {i.op_str}\n"
+                return eax_new_val, data_to_display
+
+            # extract the value from memory (we can use this function recursive to extract the other registers inside the [] if needed)
+            elif inst.mnemonic == 'mov' and (inst.op_str.startswith('eax') or inst.op_str.startswith('rax')):
+                return None, ''#pass # prev_instructions[:c_index??]
+
+            # we dont know how to get this value from pop
+            elif inst.mnemonic == 'pop' and (inst.op_str.startswith('eax') or inst.op_str.startswith('rax')):
+                return None, ''#pass 
+
+            # we dont know how to get this value from pop
+            elif inst.mnemonic in ['test', '???']:
+                return None, ''#pass
+
+            c_index -= 1
+            instruction_to_reg.append(inst)
+            
+        return None, None
 
 
     def _generator(self, data):
@@ -226,7 +227,6 @@ class DirectSyscalls(interfaces.plugins.PluginInterface):
         # now go through the process and dll lists
         for proc in process_list:
             proc_id = "Unknown"
-            print('asd')
             try:
                 proc_id = proc.UniqueProcessId
                 process_name = proc.ImageFileName.cast(
@@ -242,7 +242,8 @@ class DirectSyscalls(interfaces.plugins.PluginInterface):
                     )
                 )
                 continue
-                    # if we're on a 64 bit kernel, we may still need 32 bit disasm due to wow64
+            
+            # if we're on a 64 bit kernel, we may still need 32 bit disasm due to wow64
             if is_32bit_arch or proc.get_is_wow64():
                 architecture = "intel"
                 if has_capstone:
@@ -268,6 +269,7 @@ class DirectSyscalls(interfaces.plugins.PluginInterface):
                     break
 
         try:
+            # get all ntdll exports
             ntdll_exports = self.get_dll_exports(
                 self._context, pe_table_name, proc_layer_name, entry.DllBase
             )
@@ -276,22 +278,9 @@ class DirectSyscalls(interfaces.plugins.PluginInterface):
                 constants.LOGLEVEL_VVV,
                 f"Error while pefile {process_name}, {proc_id}\n{ex}",
             )
-            print('we fucked')
             return
         
-        for export in ntdll_exports:
-            print(export)
         syscalls = sorted([i for i in ntdll_exports if i[1] and i[1].startswith(b'Zw')])
-        addr = syscalls[0][0]
-        #syscalls = [(c_name.decode(), c_address, c_oridinal) if c_name.startswith(b'Nt') for c_name, c_address, c_oridinal in ntdll_exports]
-        print(syscalls)
-        proc_layer_name = proc.add_process_layer()
-        proc_layer = self.context.layers[proc_layer_name]
-        for item in syscalls:
-            addr = item[0]
-            data = proc_layer.read(addr, 16, pad=True)
-            for i in capst.disasm(data, 0):
-                print(i)
 
         for proc in process_list:
             process_name = utility.array_to_string(proc.ImageFileName)
@@ -299,20 +288,93 @@ class DirectSyscalls(interfaces.plugins.PluginInterface):
             for vad, data in self.list_injections(
                 self.context, kernel.layer_name, kernel.symbol_table_name, proc
             ):
+                #print(data[0x1200:0x1300], type(data))
                 # if we're on a 64 bit kernel, we may still need 32 bit disasm due to wow64
                 if is_32bit_arch or proc.get_is_wow64():
-                    architecture = "intel"
                     if has_capstone:
+                        eax_or_rax_id = capstone.x86.X86_REG_EAX
                         capst = capstone.Cs(capstone.CS_ARCH_X86, capstone.CS_MODE_32)
+                        capst.detail = True
                 else:
-                    architecture = "intel64"
                     if has_capstone:
+                        eax_or_rax_id = capstone.x86.X86_REG_RAX
                         capst = capstone.Cs(capstone.CS_ARCH_X86, capstone.CS_MODE_64)
-            
-                for i in capst.disasm(data, 0):
-                    if 'int 0x2e' in str(i).lower() or 'sysenter' in str(i).lower() or 'syscall' in str(i).lower() or 'int 2e' in str(i).lower():
-                        print(i)
+                        capst.detail = True
+                
+                prev_instructions = []
+                syscall_like = [b'\x0f\x05', # Syscall
+                                #b'\x0f\x34', # Sysenter # remove a lot of FP's and kinda old and not really used (enable if you use such os)
+                                #b'\xcd\x2e', # int 0x2e
+                                 ]
+                start_address = vad.get_start()
+                extend_after_by = 20
+                for c_syscall in syscall_like:
+                    c_syscall_len = len(c_syscall)
+                    for c_byte_index in range(0, len(data) - c_syscall_len, 1):
+                        c_data = data[c_byte_index:c_byte_index+c_syscall_len]
+                        if c_data == c_syscall:
 
+                            # Try to dissasembly the data to find the syscall instruction
+                            for start_from in range(25 if c_byte_index > 25 else c_byte_index, 0, -1):
+                                extended_chunk = data[c_byte_index-start_from:c_byte_index+extend_after_by]
+                                inst_data = "\n"
+                                flag_good_data = False
+                                prev_instructions = []
+                                for i in capst.disasm(extended_chunk, 0):
+                                    prev_instructions.append(i)
+                                    inst_data += f"{hex((start_address+c_byte_index-start_from)+i.address)}\t{i.mnemonic} {i.op_str}"
+
+                                    # we decide that the data is good if the disass contains our instruction
+                                    if c_syscall in bytes(i.opcode)[:c_syscall_len]:
+                                        #print(start_from)
+                                        
+                                        # display only current syscall and above
+                                        if start_from > 10:
+                                            inst_data = ''
+                                            prev_instructions = []
+                                            continue
+
+                                        if flag_good_data:
+                                            break
+
+                                        eax, data_to_display = self.extract_reg_at_offset(prev_instructions, eax_or_rax_id, vad.get_start())
+                                        if eax:
+                                            c_direct_syscall = syscalls[eax][1].decode()
+                                        else:
+                                            eax = -1
+                                            c_direct_syscall = 'failed to identify'
+                                        inst_data += f"\t<{c_direct_syscall} [syscall]>\n"
+                                        flag_good_data = True
+                                    else:
+                                        inst_data += "\n"
+                                
+                                # if we found our hash in the Dissasembly -> break
+                                if flag_good_data:
+                                    c_byte_index += extend_after_by
+                                    yield (
+                                            0,
+                                            (
+                                                proc.UniqueProcessId,
+                                                process_name,
+                                                format_hints.Hex(vad.get_start()),
+                                                format_hints.Hex(vad.get_end()),
+                                                vad.get_tag(),
+                                                vad.get_protection(
+                                                    vadinfo.VadInfo.protect_values(
+                                                        self.context,
+                                                        kernel.layer_name,
+                                                        kernel.symbol_table_name,
+                                                    ),
+                                                    vadinfo.winnt_protections,
+                                                ),
+                                                vad.get_commit_charge(),
+                                                vad.get_private_memory(),
+                                                eax,
+                                                c_direct_syscall,
+                                                inst_data,
+                                            ),
+                                        )
+                                    break
 
     def run(self):
         filter_func = pslist.PsList.create_pid_filter(self.config.get("pid", None))
@@ -322,8 +384,15 @@ class DirectSyscalls(interfaces.plugins.PluginInterface):
             [
                 ("PID", int),
                 ("Process", str),
-                ("Is Packed", str),
-                ("Packer Name", str),
+                ("Start VPN", format_hints.Hex),
+                ("End VPN", format_hints.Hex),
+                ("Tag", str),
+                ("Protection", str),
+                ("CommitCharge", int),
+                ("PrivateMemory", int),
+                ("Syscall EAX", int),
+                ("Syscall Funtion", str),
+                ("Disasm", str),
             ],
             self._generator(
                 pslist.PsList.list_processes(
